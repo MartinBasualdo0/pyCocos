@@ -32,6 +32,19 @@ class RestClient:
             urls.endpoints["token"], method="post", params=params, data=data
         )
 
+    def get_2factors(self):
+        return self.api_request(urls.endpoints["2factors"])
+
+    def submit_challenge_request(self, challenge_id: str):
+        return self.api_request(
+            urls.endpoints["challenge"].format(challenge_id), method="post"
+        )
+
+    def submit_challenge_verification(self, challenge_id: str, json: str):
+        return self.api_request(
+            urls.endpoints["verify"].format(challenge_id), method="post", json_data=json
+        )
+
     def logout(self) -> None:
         """Makes a request to the api to logout current session
 
@@ -248,7 +261,7 @@ class RestClient:
         Returns:
             dict: API Response
         """
-        return self.api_request(urls.endpoints["repo"], method="post", data=data)
+        return self.api_request(urls.endpoints["repo"], method="post", json_data=data)
 
     def get_buying_power(self) -> Dict[str, Any]:
         """Makes a request to get available money
@@ -275,7 +288,7 @@ class RestClient:
         Returns:
             dict: Dictionary with quotes and additional info
         """
-        return self.api_request(urls.endpoints["dolar_mep"])
+        return self.api_request(urls.endpoints["new_dolar_mep"])
 
     def get_open_dolar_mep(self) -> Dict[str, Any]:
         """Makes a request to get bot's dolar mep quotes
@@ -323,11 +336,11 @@ class RestClient:
         """
         return self.api_request(
             urls.endpoints["tickers_list"].format(
-                instrument_type.value,
-                instrumet_subtype.value,
-                settlement.value,
-                currency.value,
-                segment.value,
+                instrument_type,
+                instrumet_subtype,
+                settlement,
+                currency,
+                segment,
             )
         )
 
@@ -449,14 +462,13 @@ class RestClient:
             )
 
         if method == "delete":
-            response = self.session.delete(
-                self._api_url(path), json=json_data
-            )
+            response = self.session.delete(self._api_url(path), json=json_data)
+
         if not response:
-            raise ApiException("Bad HTTP API Response")
+            raise ApiException(f"Bad HTTP API Response. Error code: {response.status_code}. Server response {response.text}")
 
         json_response = simplejson.loads(response.text)
-        
+
         if response.status_code == 401:
             if retry:
                 self.api_request(path, retry=False)

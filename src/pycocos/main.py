@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
+import pyotp
 import json
+import time
 
 from .components import (
     ApiException,
@@ -27,7 +29,7 @@ class Cocos:
         "Content-Type": "application/json",
     }
 
-    def __init__(self, email: str, password: str, gotrue_meta_security: Optional[Dict[str, Any]] = {}, api_key: Optional[str] = None) -> None:
+    def __init__(self, email: str, password: str, gotrue_meta_security: Optional[Dict[str, Any]] = {}, api_key: Optional[str] = None, topt_secret_key: Optional[str] = None) -> None:
         ## Parameters validation
         required_fields: list[tuple[str, Any, Any]]  = [
             ("email", email, str),
@@ -55,6 +57,15 @@ class Cocos:
         self.gotrue_meta_security: Dict[str, Any] = gotrue_meta_security
         #self.recaptcha_token: str = recaptcha_token
         self.account_number: str = ""
+        self.access_token: str = "" 
+        self.token_expiration: int = 0
+        self.refresh_token: str = "" 
+
+        if topt_secret_key:
+            self.topt = pyotp.TOTP(topt_secret_key)
+        else:
+            self.topt = None
+
         if not api_key: 
             self.api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ewogICJyb2xlIjogImFub24iLAogICJpc3MiOiAic3VwYWJhc2UiLAogICJpYXQiOiAxNzA0NjgyODAwLAogICJleHAiOiAxODYyNTM1NjAwCn0.f0w62k0q0eyyGBDkAP7vUUEg_Ingb9YbOlhsGCC4R3c"  # Working apikey from main JS File - 2024-02-05.
         else:
@@ -95,7 +106,49 @@ class Cocos:
             raise Exception("Error: Access token not found in the API response")
 
         self.access_token = response["access_token"]
-        self._auth_phase_2()
+        self.refresh_token = response["refresh_token"]
+        self.token_expiration = response["expires_at"]
+
+        self._2fa_challenge()
+
+    def _2fa_challenge(self) -> None:
+        headers_update: dict[str, str] = {
+            "apikey": self.api_key,
+            "authorization": f"Bearer {self.access_token}",
+        }
+        
+        self.client.update_session_headers(headers_update)
+        second_factor_response = self.client.get_2factors()
+        #if "requireChallenge" in second_factor_response.keys() and second_factor_response["requireChallenge"]:
+        if "id" in second_factor_response.keys():
+            challenge_id = second_factor_response["id"]
+        else:
+            raise Exception("Error: 2FA challenge not found in the API response, please share the broswer response on GitHub so i can implement this.")
+        
+        payload = json.dumps({
+            "expires_at": 123, 
+            "id": challenge_id,
+        })
+
+        challenge = self.client.submit_challenge_request(challenge_id=challenge_id)
+        
+        if challenge_id not in ["mail", "sms"] and self.topt is not None:
+            code = self.topt.now()
+        else:
+            code = input("Insert 2FA Code: ")
+        payload = {
+            "challenge_id": "_",
+            "code": code,
+        }
+        
+        #self.client.update_session_headers(headers_update)        
+        response = self.client.submit_challenge_verification(challenge_id=challenge_id, json=payload)
+
+        if "access_token" not in response.keys():
+            raise Exception("Error: Access token not found in the API response")
+        else:
+            self.access_token = response["access_token"]
+            self._auth_phase_2()
 
     def _auth_phase_2(self) -> None:
         """Updates the session headers and performs additional steps after login.
@@ -121,6 +174,37 @@ class Cocos:
         self.client.update_session_headers({"x-account-id": self.account_number})
         self.connected = True
 
+    def _refresh_access_token(self) -> None: 
+        params = "grant_type=refresh_token"
+
+        payload = {
+            "refresh_token": self.refresh_token
+        }
+        response = self.client.get_token(params=params, data=json.dumps(payload))
+        if response:
+            self.access_token = response["access_token"]
+            self.refresh_token = response["refresh_token"]
+            self.token_expiration = response["expires_at"]
+
+    def check_token_expiration(self):
+        
+        headers_update = {
+            "Apikey": self.api_key,
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        self.client.update_session_headers(headers_update)
+
+        if self.connected and time.time() > self.token_expiration:
+            self._refresh_access_token()
+
+        headers_update: dict[str, str] = {
+            "apikey": "",
+            "authorization": f"Bearer {self.access_token}",
+            #"recaptcha-token": self.recaptcha_token,
+            "x-account-id": self.account_number,
+        }
+        self.client.update_session_headers(headers_update)
+
     def logout(self) -> None:
         """Logs out from the broker API.
 
@@ -130,6 +214,8 @@ class Cocos:
 
         Note: Make sure to handle any additional cleanup or resource release operations, if required, after calling this method.
         """
+
+        self.check_token_expiration()
         self.client.logout()
         self.connected = False
 
@@ -151,6 +237,7 @@ class Cocos:
         Raises:
             Exception: If there is an error while retrieving the account owner's personal information.
         """
+        self.check_token_expiration()        
         return self.client.get_my_data()
 
     def my_bank_accounts(self) -> List[Dict[str, Any]]:
@@ -167,6 +254,7 @@ class Cocos:
         Raises:
             Exception: If there is an error while retrieving the registered bank accounts.
         """
+        self.check_token_expiration()        
         return self.client.get_bank_accounts()
 
     def my_portfolio(self) -> Dict[str, Any]:
@@ -183,6 +271,7 @@ class Cocos:
         Raises:
             Exception: If there is an error while retrieving the portfolio information.
         """
+        self.check_token_expiration()        
         response: Dict[str, Any] = self.client.get_portfolio()
         return response
 
@@ -201,6 +290,7 @@ class Cocos:
         Raises:
             Exception: If there is an error while retrieving the available funds.
         """
+        self.check_token_expiration()        
         return self.client.get_buying_power()
 
     def stocks_available(self, long_ticker: str) -> Dict[str, int]:
@@ -224,7 +314,8 @@ class Cocos:
         # Parameters validation
         required_fields: list[tuple[str, Any, Any]]  = [("long_ticker", long_ticker, str)]
         self._check_fields(required_fields)
-
+        
+        self.check_token_expiration()
         return self.client.get_selling_power(long_ticker)
 
     def account_activity(self, date_from: str, date_to: str) -> List[Dict[str, Any]]:
@@ -251,7 +342,7 @@ class Cocos:
         required_fields: list[tuple[str, Any, Any]]  = [("date_from", date_from, str), ("date_to", date_to, str)]
 
         self._check_fields(required_fields)
-
+        self.check_token_expiration()
         return self.client.get_account_movements(date_from, date_to)
 
     def portfolio_performance(
@@ -288,11 +379,18 @@ class Cocos:
         # Parameters validation
         required_fields: list[tuple[str, Any, Any]]  = [("timeframe", timeframe, PerformanceTimeframe)]
         self._check_fields(required_fields)
-
-        if timeframe != self.performance_timeframes.RANGE:
+        self.check_token_expiration()
+        if timeframe == self.performance_timeframes.DAILY:
             return self.client.get_daily_performance()
-        else:
+        elif timeframe == self.performance_timeframes.HISTORICAL:
+            return self.client.get_historic_performance()
+        elif timeframe == self.performance_timeframes.RANGE:
             return self.client.get_performance_period(date_from, date_to)
+        else:
+            raise ValueError(
+                f"Invalid timeframe: {timeframe}. Possible values are {self.performance_timeframes.DAILY}, "
+                f"{self.performance_timeframes.HISTORICAL}, and {self.performance_timeframes.RANGE}"
+            )
 
     def submit_new_bank_account(
         self, cbu: str, cuit: str, currency: Currency
@@ -327,6 +425,7 @@ class Cocos:
         payload: str = json.dumps(
             {"cbu_cvu": cbu, "cuit": cuit, "currency": currency.value}
         )
+        self.check_token_expiration()        
         response: Dict[str, Any] = self.client.submit_new_bank_account(data=payload)
         return response
 
@@ -374,7 +473,7 @@ class Cocos:
                 "cbu_cvu": cbu_cvu,
             }
         )
-
+        self.check_token_expiration()
         response = self.client.submit_funds_withdraw(data=payload)
         return response
 
@@ -428,7 +527,7 @@ class Cocos:
         # Check if account has enough money to purchase
         if not self._validate_buy_order(payload):
             raise ApiException(f"Not enough money to purchase")
-
+        self.check_token_expiration()
         response: Dict[str, Any] = self.client.submit_order(json=payload)
         if "success" in response.keys():
             self._add_order(response["Orden"])
@@ -476,7 +575,7 @@ class Cocos:
             "long_ticker": long_ticker,
             "price": price,
         }
-
+        self.check_token_expiration()
         response: Dict[str, Any] = self.client.submit_order(json=payload)
         return response
 
@@ -510,15 +609,14 @@ class Cocos:
         self._check_fields(required_fields)
 
         # Create payload object
-        payload: str = json.dumps(
-            {
+        payload ={
                 "currency": currency.value,
                 "amount": amount,
                 "term": term,
                 "rate": rate,
             }
-        )
-
+        
+        self.check_token_expiration()
         response: Dict[str, Any] = self.client.submit_repo_order(data=payload)
         return response
 
@@ -547,7 +645,7 @@ class Cocos:
         payload: str = json.dumps(
             {"instrument": order["instrument"], "ticker": order["ticker"]}
         )
-
+        self.check_token_expiration()
         response: Dict[str, Any] = self.client.cancel_order(order_number, data=payload)
         return response
 
@@ -571,7 +669,7 @@ class Cocos:
         # Parameters validation
         required_fields: list[tuple[str, Any, Any]]  = [("order_number", order_number, str)]
         self._check_fields(required_fields)
-
+        self.check_token_expiration()
         if order_number:
             return self.client.get_order(order_number)
         else:
@@ -601,7 +699,7 @@ class Cocos:
             ("date_from", date_from, str),
         ]
         self._check_fields(required_fields)
-
+        self.check_token_expiration()
         return self.client.get_historic_data(long_ticker, date_from)
 
     def get_instrument_snapshot(
@@ -626,7 +724,7 @@ class Cocos:
             ("segment", segment, Segment),
         ]
         self._check_fields(required_fields)
-
+        self.check_token_expiration()
         return self.client.get_tickers(ticker, segment.value)
 
     def get_instrument_list_snapshot(
@@ -673,7 +771,7 @@ class Cocos:
             raise ValueError(
                 "Invalid combination for instrument type and subtype. Check instrument_types_and_subtypes method."
             )
-
+        self.check_token_expiration()
         return self.client.get_tickers_list(
             instrument_type.value,
             instrument_subtype.value,
@@ -801,6 +899,7 @@ class Cocos:
 
         if len(query) < 2:
             raise ValueError("Query must be at least 2 characters long")
+        self.check_token_expiration()        
         return self.client.search_tickers(query)
 
     #################
@@ -819,7 +918,7 @@ class Cocos:
             The structure and content of the returned dictionary may vary depending on the API response.
 
         """
-
+        self.check_token_expiration()
         return self.client.get_market_status()
 
     def instruments_rules(self) -> Dict[str, Any]:
@@ -835,7 +934,7 @@ class Cocos:
             The structure and content of the returned dictionary may vary depending on the API response.
 
         """
-
+        self.check_token_expiration()
         return self.client.get_instrument_rules()
 
     def instrument_types_and_subtypes(self) -> List[Dict[str, Any]]:
@@ -901,7 +1000,7 @@ class Cocos:
     ###############
 
     def get_dolar_mep_info(self) -> Dict[str, Any]:
-        """Calls API to retrieve the current value of the Closed "Dólar MEP" exchange rate.
+        """Calls API to retrieve the current value of the "Dólar MEP" exchange rate.
 
         The "Dólar MEP" is an exchange rate used in Argentina for the conversion of local currency
         to US dollars through electronic payment systems. This method calls the API to fetch the
@@ -911,13 +1010,13 @@ class Cocos:
         Cocos Capital has a special Dolar Mep (closed price) venue with a warranted price.
 
         Returns:
-            Dict[str, Any]: API Response with the current value of the "Dólar MEP" exchange rate.
+            Dict[str, Any]: API Response with the current value of the "Dólar MEP" exchange rate. Open key returns "Precio Estimado", Close key returns "Precio Asegurado".
 
         Note:
             The structure and content of the returned dictionary may vary depending on the API response.
 
         """
-
+        self.check_token_expiration()
         return self.client.get_dolar_mep()
 
     def get_open_dolar_mep_info(self) -> Dict[str, Any]:
@@ -987,7 +1086,7 @@ class Cocos:
             The structure and content of the returned dictionary may vary depending on the API response.
 
         """
-
+        self.check_token_expiration()
         return self.client.get_university()
 
     #############
@@ -1054,7 +1153,7 @@ class Cocos:
         long_ticker: str = payload['long_ticker']
         instrument_code, settlement, segment, _, currency = long_ticker.split("-")
         
-        #instrument_code = self._find_instrument_code(long_ticker)
+        global_instrument_code = self._find_instrument_code(long_ticker)
         settlement = self._get_cocos_settlement(settlement)
         segment = self._get_cocos_segment(segment)
         
@@ -1075,12 +1174,12 @@ class Cocos:
         
         # check order total
         if "price" not in payload:
-            price = self._get_instrument_snapshot_value_by_key(instrument_code, long_ticker, segment, "ask")
+            price = self._get_instrument_snapshot_value_by_key(global_instrument_code, long_ticker, segment, "ask")
         else:
             price = payload["price"]
         
         if 'amount' not in payload.items():
-            price_factor = self._get_price_factor(instrument_code, long_ticker, segment)
+            price_factor = self._get_price_factor(global_instrument_code, long_ticker, segment)
             order_total = float(payload["quantity"]) * float(payload["price"]) / price_factor
         else:
             order_total = float(payload["amount"])
@@ -1122,13 +1221,14 @@ class Cocos:
         Returns:
             str: The instrument code, or "" if not found.
         """
+        short_ticker = long_ticker.split("-")[0]
         ticker_search: List[Dict[str, Any]] = self.search_ticker(
-            long_ticker.split("-")[0]
+            short_ticker
         )
         for ticker in ticker_search:
             for subtype in ticker["instrument_subtypes"]:
                 for data in subtype["market_data"]:
-                    if data.get("long_ticker") == long_ticker:
+                    if data.get("short_ticker") == short_ticker:
                         return data["instrument_code"]
         return ""
 
